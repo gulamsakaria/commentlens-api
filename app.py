@@ -7,10 +7,14 @@ for a light, fast CPU footprint) and serves it over a small FastAPI app.
 
 Classes: claim, general, opinion, spam-scam, toxic
 """
+import csv
+import os
+import re
 import time
 import json
 import logging
 import unicodedata
+from collections import OrderedDict
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -30,6 +34,22 @@ MODEL_REPO = "gulamsakaria/commentlens-banglishbert"
 ONNX_FILENAME = "onnx/model_quantized.onnx"
 MAX_LENGTH = 128
 NEWS_INDEX_REPO = "gulamsakaria/commentlens-news-index"
+
+# The daily scraper writes one CSV per day to this repo at exports/YYYY-MM-DD.csv
+# with columns id, source, headline, body, url, published_date, category, scraped_at
+# (see daily_update.py). meta.json in NEWS_INDEX_REPO only carries
+# headline/date/link forward - body text never made it into the index - so
+# verifying a QUOTE claim against actual article body text means reaching
+# back into this archive repo on demand, by date + link, at request time.
+NEWS_ARCHIVE_REPO = "gulamsakaria/commentlens-news-archive"
+# HF_TOKEN is intentionally scoped write-only on the index repo, so reading
+# the archive needs its own token; same fallback daily_update.py/backfill_index.py
+# use. NOTE: as of this change, only HF_TOKEN is configured on Render - if it
+# can't read commentlens-news-archive, body lookups fail closed (see
+# _fetch_article_body) and QUOTE claims simply can't be backed until
+# HF_ARCHIVE_TOKEN (or a token with archive read access) is added to Render's
+# environment.
+ARCHIVE_TOKEN = os.environ.get("HF_ARCHIVE_TOKEN") or os.environ.get("HF_TOKEN")
 
 # --- News-matching tuning -----------------------------------------------
 # These are starting points, not exact science - tune them against a
@@ -72,10 +92,164 @@ BANGLA_WORD_TOKEN_PATTERN = r"[\u0980-\u09FF\u200C\u200D]+|[A-Za-z0-9]+"
 
 MIN_CHAR_SCORE = 0.12
 MIN_WORD_SCORE = 0.08
-# A match can pass the floor above yet still be a fairly weak, low-confidence
-# echo. "backed" is reserved for a genuinely strong match so the popup badge
-# doesn't call a weak coincidence "news-backed".
+
+# --- Quote vs. event claims ----------------------------------------------
+# A claim like "X \u09AC\u09B2\u09C7\u099B\u09C7\u09A8 Y" (X said Y) is an assertion about WHAT X SAID -
+# a headline/article that merely mentions X (in an unrelated quote or
+# event) is not evidence for it, no matter how high it scores on
+# entity/topic overlap. An "event" claim ("X \u09AE\u09BE\u09B2\u09AF\u09BC\u09C7\u09B6\u09BF\u09AF\u09BC\u09BE \u09A5\u09C7\u0995\u09C7 \u09AB\u09BF\u09B0\u09C7\u099B\u09C7\u09A8" - X
+# returned from Malaysia) is an assertion about something that HAPPENED,
+# which the existing headline-similarity approach is actually suited to.
+# These attribution verbs are the same family used when labeling the
+# 'claim' class in training data - a claim quoting/attributing a statement
+# to someone almost always surfaces one of these verb forms.
+_ATTRIBUTION_VERBS = [
+    "\u09AC\u09B2\u09C7\u099B\u09C7\u09A8", "\u09AC\u09B2\u09C7\u09A8", "\u09AC\u09B2\u099B\u09C7\u09A8", "\u09AC\u09B2\u09C7 \u099C\u09BE\u09A8\u09BE\u09A8", "\u09AC\u09B2\u09C7 \u099C\u09BE\u09A8\u09BF\u09AF\u09BC\u09C7\u099B\u09C7\u09A8",
+    "\u099C\u09BE\u09A8\u09BF\u09AF\u09BC\u09C7\u099B\u09C7\u09A8", "\u099C\u09BE\u09A8\u09BE\u09A8", "\u099C\u09BE\u09A8\u09BE\u09AF\u09BC",
+    "\u09A6\u09BE\u09AC\u09BF \u0995\u09B0\u09C7\u099B\u09C7\u09A8", "\u09A6\u09BE\u09AC\u09BF \u0995\u09B0\u09C7\u09A8", "\u09A6\u09BE\u09AC\u09BF \u0995\u09B0\u09C7",
+    "\u0998\u09CB\u09B7\u09A3\u09BE \u0995\u09B0\u09C7\u099B\u09C7\u09A8", "\u0998\u09CB\u09B7\u09A3\u09BE \u0995\u09B0\u09C7\u09A8",
+    "\u0989\u09B2\u09CD\u09B2\u09C7\u0996 \u0995\u09B0\u09C7\u099B\u09C7\u09A8", "\u0989\u09B2\u09CD\u09B2\u09C7\u0996 \u0995\u09B0\u09C7\u09A8",
+    "\u09AE\u09A8\u09CD\u09A4\u09AC\u09CD\u09AF \u0995\u09B0\u09C7\u099B\u09C7\u09A8", "\u09AE\u09A8\u09CD\u09A4\u09AC\u09CD\u09AF \u0995\u09B0\u09C7\u09A8",
+    "\u09B8\u09CD\u09AC\u09C0\u0995\u09BE\u09B0 \u0995\u09B0\u09C7\u099B\u09C7\u09A8", "\u09B8\u09CD\u09AC\u09C0\u0995\u09BE\u09B0 \u0995\u09B0\u09C7\u09A8",
+    "\u0985\u09AD\u09BF\u09AF\u09CB\u0997 \u0995\u09B0\u09C7\u099B\u09C7\u09A8", "\u0985\u09AD\u09BF\u09AF\u09CB\u0997 \u0995\u09B0\u09C7\u09A8",
+    "\u09B2\u09BF\u0996\u09C7\u099B\u09C7\u09A8", "\u09AA\u09CB\u09B8\u09CD\u099F \u0995\u09B0\u09C7\u099B\u09C7\u09A8", "\u099F\u09C1\u0987\u099F \u0995\u09B0\u09C7\u099B\u09C7\u09A8",
+]
+ATTRIBUTION_PATTERN = re.compile("|".join(re.escape(v) for v in _ATTRIBUTION_VERBS))
+
+# Generic connectors/particles to drop when pulling the "content words" out
+# of a quote claim for body-text overlap checking - these carry no
+# information about WHAT was said, so counting them as "overlap" with an
+# article body would understate how little the claim and the body actually
+# have in common.
+_GENERIC_CONTENT_WORDS = {
+    "\u098F\u09AC\u0982", "\u0993", "\u098F\u09B0", "\u098F\u0995\u099F\u09BF", "\u098F\u0987", "\u09B8\u09C7\u0987", "\u0986\u099C", "\u0997\u09A4\u0995\u09BE\u09B2", "\u09A8\u09A4\u09C1\u09A8",
+    "\u09A5\u09C7\u0995\u09C7", "\u09A8\u09BF\u09AF\u09BC\u09C7", "\u09B8\u0999\u09CD\u0997\u09C7", "\u09AA\u09B0\u09C7", "\u0986\u0997\u09C7", "\u09AC\u09B2\u09C7", "\u09AF\u09C7", "\u09A4\u09BE\u09B0", "\u09A4\u09BF\u09A8\u09BF",
+    "\u0995\u09B0\u09C7", "\u0995\u09B0\u09C7\u09A8", "\u09B9\u09AF\u09BC\u09C7\u099B\u09C7", "\u09B9\u09AF\u09BC", "\u0995\u09C7", "\u09A4\u09BE", "\u098F", "\u0993",
+}
+
+# QUOTE claims: a candidate is only "backed" if this fraction (and at least
+# this many distinct words) of the claim's own content words actually show
+# up in that article's body text - not just its headline. This is what
+# stops "X \u09AC\u09B2\u09C7\u099B\u09C7\u09A8 Y" from being backed just because some article mentions X
+# in a different context: X's name alone is 1-2 words out of several, so it
+# clears neither the fraction nor the count floor by itself.
+QUOTE_BODY_OVERLAP_MIN_FRACTION = 0.5
+QUOTE_BODY_OVERLAP_MIN_COUNT = 2
+
+# EVENT claims: keep using headline TF-IDF similarity, but hold it to a
+# higher bar than before (0.17-0.34 was letting through matches that only
+# shared generic topic words) and require the top match to actually stand
+# out from the rest of the pack, not just barely clear a floor alongside
+# several similarly-scored unrelated headlines.
+EVENT_BACKED_MIN_SCORE = 0.40
+EVENT_BACKED_MARGIN = 0.08
+
+# Kept only for the /match_claim "matches" list floor (which candidates are
+# worth returning to the frontend at all) - no longer what decides `backed`
+# on its own for either claim type.
 BACKED_MIN_SCORE = 0.25
+
+
+def _is_quote_claim(text: str) -> bool:
+    """True if the claim text attributes a statement to someone (contains
+    one of the attribution verb forms above) - see the comment above
+    ATTRIBUTION_PATTERN for why this needs a different backing check than
+    a plain event claim."""
+    return ATTRIBUTION_PATTERN.search(_normalize_text(text)) is not None
+
+
+def _extract_content_words(text: str) -> List[str]:
+    """Whole Bangla/Latin words (same tokenization as the word-level TF-IDF
+    index - see BANGLA_WORD_TOKEN_PATTERN), minus generic connectors and
+    single-character fragments, deduplicated. This is deliberately simple
+    (no NER, no POS tagging) - it's a floor on "does the body text actually
+    talk about the same specific thing", not a claim of true semantic
+    understanding."""
+    tokens = re.findall(BANGLA_WORD_TOKEN_PATTERN, _normalize_text(text))
+    seen = []
+    for tok in tokens:
+        if len(tok) < 2 or tok in _GENERIC_CONTENT_WORDS:
+            continue
+        if tok not in seen:
+            seen.append(tok)
+    return seen
+
+
+# LRU-ish cache of already-downloaded/parsed archive days, so repeated
+# QUOTE-claim requests hitting the same handful of recent dates don't
+# re-download+re-parse a CSV per request. hf_hub_download already caches
+# the raw file on disk, so this cache is really just for skipping the CSV
+# parse; still bounded so a long-running instance can't grow this forever.
+_ARCHIVE_DAY_CACHE: "OrderedDict[str, Dict[str, str]]" = OrderedDict()
+_ARCHIVE_DAY_CACHE_MAX = 60
+
+
+def _load_archive_day(date: str) -> Dict[str, str]:
+    """Return {link: body} for every article the archive recorded on
+    `date`, downloading+parsing exports/{date}.csv from NEWS_ARCHIVE_REPO
+    on first use. Raises on any failure (missing token/permission, no
+    export for that date, network error) - callers decide how to degrade."""
+    if date in _ARCHIVE_DAY_CACHE:
+        _ARCHIVE_DAY_CACHE.move_to_end(date)
+        return _ARCHIVE_DAY_CACHE[date]
+
+    csv_path = hf_hub_download(
+        NEWS_ARCHIVE_REPO,
+        f"exports/{date}.csv",
+        repo_type="dataset",
+        token=ARCHIVE_TOKEN,
+    )
+    by_link: Dict[str, str] = {}
+    with open(csv_path, encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            link = row.get("url") or row.get("link")
+            body = row.get("body")
+            if link and body:
+                by_link[link] = body
+
+    _ARCHIVE_DAY_CACHE[date] = by_link
+    _ARCHIVE_DAY_CACHE.move_to_end(date)
+    while len(_ARCHIVE_DAY_CACHE) > _ARCHIVE_DAY_CACHE_MAX:
+        _ARCHIVE_DAY_CACHE.popitem(last=False)
+    return by_link
+
+
+def _fetch_article_body(date: Optional[str], link: Optional[str]) -> Optional[str]:
+    """Best-effort lookup of a candidate's full article body text from the
+    archive repo. Returns None (never raises) on anything short of
+    success - a missing/unreadable archive means QUOTE claims fail closed
+    (can't be backed) rather than the endpoint erroring out."""
+    if not date or not link:
+        return None
+    try:
+        return _load_archive_day(date).get(link)
+    except Exception as exc:
+        logger.warning("Could not fetch archive body for %s / %s: %s", date, link, exc)
+        return None
+
+
+def _quote_backed_by_body(claim_text: str, candidates: List[dict]) -> bool:
+    """QUOTE-claim backing: true only if at least one candidate's actual
+    article BODY text substantively overlaps with the claim's own content
+    words - entity/topic-only overlap (the failure mode this whole change
+    is fixing) isn't enough. See QUOTE_BODY_OVERLAP_MIN_FRACTION/_COUNT."""
+    claim_words = _extract_content_words(claim_text)
+    if not claim_words:
+        return False
+
+    for record in candidates:
+        body = _fetch_article_body(record.get("date"), record.get("link"))
+        if not body:
+            continue
+        normalized_body = _normalize_text(body)
+        overlap = [w for w in claim_words if w in normalized_body]
+        if (
+            len(overlap) >= QUOTE_BODY_OVERLAP_MIN_COUNT
+            and len(overlap) / len(claim_words) >= QUOTE_BODY_OVERLAP_MIN_FRACTION
+        ):
+            return True
+    return False
+
 
 ID2LABEL = {0: "claim", 1: "general", 2: "opinion", 3: "spam-scam", 4: "toxic"}
 
@@ -324,6 +498,7 @@ def match_claim(req: MatchClaimRequest):
     top_indices = combined_scores.argsort()[::-1][: req.top_k]
 
     matches = []
+    matched_records = []  # parallel to `matches`, keeps the raw meta record
     for idx in top_indices:
         char_score = float(char_scores[idx])
         word_score = float(word_scores[idx])
@@ -342,8 +517,26 @@ def match_claim(req: MatchClaimRequest):
                 score=float(combined_scores[idx]),
             )
         )
+        matched_records.append(record)
 
-    backed = any(m.score >= BACKED_MIN_SCORE for m in matches)
+    # A claim that attributes a specific statement to someone ("X বলেছেন
+    # Y") needs the underlying article BODY to actually support what was
+    # said, not just headline-level entity/topic overlap - see the
+    # ATTRIBUTION_PATTERN comment. Anything else is treated as an event
+    # claim and keeps using headline similarity, but held to a higher bar
+    # than before (see EVENT_BACKED_MIN_SCORE/_MARGIN).
+    if _is_quote_claim(req.text):
+        backed = _quote_backed_by_body(req.text, matched_records)
+    elif matches:
+        top_score = matches[0].score
+        runner_up_score = matches[1].score if len(matches) > 1 else 0.0
+        backed = (
+            top_score >= EVENT_BACKED_MIN_SCORE
+            and (top_score - runner_up_score) >= EVENT_BACKED_MARGIN
+        )
+    else:
+        backed = False
+
     return MatchClaimResponse(query=req.text, matches=matches, backed=backed)
 
 
