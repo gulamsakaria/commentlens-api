@@ -10,6 +10,7 @@ Classes: claim, general, opinion, spam-scam, toxic
 import time
 import json
 import logging
+import unicodedata
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -47,50 +48,27 @@ NEWS_INDEX_REPO = "gulamsakaria/commentlens-news-index"
 # little to the score while a name that appears in only a few headlines
 # contributes a lot. Requiring both signals means a match can't be driven
 # by common vocabulary alone.
-import re
-import unicodedata
-
-_BANGLA_PUNCT_STRIP = "।,.?!\"'\u2019\u2018\u201c\u201d()[]{}:;\u2014\u2013\u2026"
-
-BANGLA_STOPWORDS = [
-    "দক্ষিণ", "উত্তর", "পূর্ব", "পশ্চিম",
-    "এশিয়া", "এশিয়ার", "এশিয়ায়", "এশিয়াকে",
-    "বিশ্ব", "বিশ্বের",
-    "বাংলাদেশ", "বাংলাদেশের", "বাংলাদেশে", "দেশ", "দেশের", "দেশে",
-    "সরকার", "সরকারের",
-    "নিয়ে", "বিষয়ে", "সম্পর্কে", "জানিয়েছে", "জানান", "বলেছেন", "বললেন",
-    "এবং", "ও", "এর", "একটি", "এই", "সেই", "আজ", "গতকাল", "নতুন",
-]
-# NFC-normalized once at import time, so every comparison below is against
-# a known-canonical form regardless of how the raw text was encoded.
-_BANGLA_STOPWORDS_SET = {unicodedata.normalize("NFC", w) for w in BANGLA_STOPWORDS}
+def _normalize_text(text: str) -> str:
+    """NFC-normalize before vectorizing, on both the index-build side and
+    the query side, so the same visible word is always the same token
+    regardless of which Unicode form it arrived in - scraped Bangla text
+    can end up in NFC or NFD form, which look identical on screen but
+    compare unequal as raw strings."""
+    return unicodedata.normalize("NFC", text)
 
 
-def _tokenize_bangla(text: str) -> List[str]:
-    """Whitespace-based tokenizer: NFC-normalizes the whole string first,
-    splits on whitespace, then strips leading/trailing punctuation from
-    each token. Deliberately NOT sklearn's default \\w-based tokenizer -
-    that regex can split Bangla conjuncts/matras inconsistently, and if the
-    scraped headline text and this file's stopword literals ever end up in
-    different Unicode normalization forms (NFC vs NFD - visually identical,
-    byte-different), an exact-match stop_words comparison silently fails.
-    Normalizing explicitly here removes that whole failure mode."""
-    text = unicodedata.normalize("NFC", text)
-    tokens = []
-    for tok in text.split():
-        tok = tok.strip(_BANGLA_PUNCT_STRIP)
-        if tok:
-            tokens.append(tok)
-    return tokens
-
-
-def _strip_stopwords(text: str) -> str:
-    """Used on BOTH sides - headlines at index-build time and the query at
-    request time - so stopword matching always compares tokens produced
-    the exact same way."""
-    kept = [t for t in _tokenize_bangla(text) if t not in _BANGLA_STOPWORDS_SET]
-    return " ".join(kept)
-
+# sklearn's default word token_pattern (r"(?u)\b\w\w+\b") was silently
+# mangling Bangla text: \b word-boundary detection doesn't reliably treat
+# Bangla vowel signs/virama as part of the surrounding word, so real words
+# like "হিমালয়ের" and "হিমবাহ" were coming out as meaningless fragments
+# ("লয়", "মব") - every earlier attempt at word-level matching here was
+# built on those fragments, not the actual words, which is why neither a
+# hand-picked stopword list nor a bare max_df setting fully worked. This
+# pattern instead takes any maximal run of Bangla-block characters (U+0980-
+# U+09FF, plus zero-width joiner/non-joiner used in some conjuncts) as one
+# token, or a maximal run of Latin letters/digits for any mixed-in English/
+# Banglish/numbers - whole words in, whole words out.
+BANGLA_WORD_TOKEN_PATTERN = r"[\u0980-\u09FF\u200C\u200D]+|[A-Za-z0-9]+"
 
 MIN_CHAR_SCORE = 0.12
 MIN_WORD_SCORE = 0.08
@@ -173,7 +151,7 @@ def _load_news_index():
         _news_meta = json.load(f)
 
     if _news_meta:
-        headlines = [rec.get("headline", "") for rec in _news_meta]
+        headlines = [_normalize_text(rec.get("headline", "")) for rec in _news_meta]
 
         # char n-grams work for Bangla script and romanized Banglish alike,
         # and don't depend on a language-specific word tokenizer - good at
@@ -183,14 +161,40 @@ def _load_news_index():
         _tfidf_vectorizer = char_vectorizer
 
         # word-level TF-IDF: the discriminator between "shares a common
-        # topic word" and "shares the actual distinctive subject" - built
-        # over pre-stripped text (see _strip_stopwords) so generic words
-        # never enter the vocabulary at all, rather than trusting sklearn's
-        # own tokenizer/stop_words matching to catch them.
-        stripped_headlines = [_strip_stopwords(h) for h in headlines]
-        word_vectorizer = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), max_features=50000)
-        _word_matrix = word_vectorizer.fit_transform(stripped_headlines)
-        _word_vectorizer = word_vectorizer
+        # topic word" and "shares the actual distinctive subject". max_df
+        # drops any word/bigram that shows up in more than 15% of all
+        # indexed headlines from the vocabulary entirely - generic filler
+        # ("এগিয়ে", "আসছে", or a common region name) naturally clears that
+        # bar across a general news archive, while an actual name or
+        # specific event essentially never does. This adapts on its own as
+        # the archive grows nightly, instead of a hand-maintained word list
+        # that has to be extended by hand every time a new generic word
+        # turns out to be common enough to cause a false match.
+        try:
+            word_vectorizer = TfidfVectorizer(
+                analyzer="word", ngram_range=(1, 2), max_features=50000, max_df=0.15,
+                token_pattern=BANGLA_WORD_TOKEN_PATTERN,
+            )
+            _word_matrix = word_vectorizer.fit_transform(headlines)
+            _word_vectorizer = word_vectorizer
+        except ValueError:
+            # Small/early archive: max_df=0.15 can legitimately wipe out the
+            # entire vocabulary when there are only a handful of headlines
+            # (a word in 2 of 10 headlines is already 20%). Fall back to no
+            # max_df rather than leaving word-level matching broken - this
+            # naturally stops triggering once the archive has enough
+            # headlines for 15% to mean something.
+            logger.warning(
+                "max_df=0.15 emptied the word-level vocabulary (archive too "
+                "small still, %d headlines) - falling back to no max_df.",
+                len(headlines),
+            )
+            word_vectorizer = TfidfVectorizer(
+                analyzer="word", ngram_range=(1, 2), max_features=50000,
+                token_pattern=BANGLA_WORD_TOKEN_PATTERN,
+            )
+            _word_matrix = word_vectorizer.fit_transform(headlines)
+            _word_vectorizer = word_vectorizer
     else:
         _tfidf_vectorizer = None
         _tfidf_matrix = None
@@ -309,8 +313,9 @@ def match_claim(req: MatchClaimRequest):
         # index is ready but has no articles indexed yet
         return MatchClaimResponse(query=req.text, matches=[], backed=False)
 
-    char_scores = linear_kernel(_tfidf_vectorizer.transform([req.text]), _tfidf_matrix)[0]
-    word_scores = linear_kernel(_word_vectorizer.transform([_strip_stopwords(req.text)]), _word_matrix)[0]
+    normalized_text = _normalize_text(req.text)
+    char_scores = linear_kernel(_tfidf_vectorizer.transform([normalized_text]), _tfidf_matrix)[0]
+    word_scores = linear_kernel(_word_vectorizer.transform([normalized_text]), _word_matrix)[0]
     # Average the two signals into one ranking/display score - char catches
     # spelling variants, word catches the actual distinctive subject; a
     # genuinely relevant headline should score reasonably on both.
