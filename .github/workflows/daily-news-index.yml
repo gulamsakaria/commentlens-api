@@ -10,7 +10,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - run: pip install sentence-transformers faiss-cpu huggingface_hub pandas
+      - run: pip install faiss-cpu huggingface_hub pandas onnxruntime transformers tokenizers numpy
       - run: python daily_update.py
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
