@@ -47,22 +47,50 @@ NEWS_INDEX_REPO = "gulamsakaria/commentlens-news-index"
 # little to the score while a name that appears in only a few headlines
 # contributes a lot. Requiring both signals means a match can't be driven
 # by common vocabulary alone.
-# Generic geographic/connector/frequent words that, on their own, say
-# nothing about WHAT a headline is actually about - they showed up as the
-# cause of a second false-positive pattern: a claim mentioning "দক্ষিণ
-# এশিয়ার" (South Asia) matched unrelated headlines that only shared those
-# two words, because a small archive doesn't have enough documents for
-# TF-IDF's IDF weighting to recognize them as generic on its own. Stripping
-# them out of the word-level vectorizer means they contribute nothing to
-# word_score - a match can only come from words that actually describe the
-# subject. Extend this list as new false positives like this turn up.
+import re
+import unicodedata
+
+_BANGLA_PUNCT_STRIP = "।,.?!\"'\u2019\u2018\u201c\u201d()[]{}:;\u2014\u2013\u2026"
+
 BANGLA_STOPWORDS = [
     "দক্ষিণ", "উত্তর", "পূর্ব", "পশ্চিম",
-    "এশিয়া", "এশিয়ার", "বিশ্ব", "বিশ্বের",
-    "বাংলাদেশ", "বাংলাদেশের", "দেশ", "দেশের", "সরকার", "সরকারের",
+    "এশিয়া", "এশিয়ার", "এশিয়ায়", "এশিয়াকে",
+    "বিশ্ব", "বিশ্বের",
+    "বাংলাদেশ", "বাংলাদেশের", "বাংলাদেশে", "দেশ", "দেশের", "দেশে",
+    "সরকার", "সরকারের",
     "নিয়ে", "বিষয়ে", "সম্পর্কে", "জানিয়েছে", "জানান", "বলেছেন", "বললেন",
     "এবং", "ও", "এর", "একটি", "এই", "সেই", "আজ", "গতকাল", "নতুন",
 ]
+# NFC-normalized once at import time, so every comparison below is against
+# a known-canonical form regardless of how the raw text was encoded.
+_BANGLA_STOPWORDS_SET = {unicodedata.normalize("NFC", w) for w in BANGLA_STOPWORDS}
+
+
+def _tokenize_bangla(text: str) -> List[str]:
+    """Whitespace-based tokenizer: NFC-normalizes the whole string first,
+    splits on whitespace, then strips leading/trailing punctuation from
+    each token. Deliberately NOT sklearn's default \\w-based tokenizer -
+    that regex can split Bangla conjuncts/matras inconsistently, and if the
+    scraped headline text and this file's stopword literals ever end up in
+    different Unicode normalization forms (NFC vs NFD - visually identical,
+    byte-different), an exact-match stop_words comparison silently fails.
+    Normalizing explicitly here removes that whole failure mode."""
+    text = unicodedata.normalize("NFC", text)
+    tokens = []
+    for tok in text.split():
+        tok = tok.strip(_BANGLA_PUNCT_STRIP)
+        if tok:
+            tokens.append(tok)
+    return tokens
+
+
+def _strip_stopwords(text: str) -> str:
+    """Used on BOTH sides - headlines at index-build time and the query at
+    request time - so stopword matching always compares tokens produced
+    the exact same way."""
+    kept = [t for t in _tokenize_bangla(text) if t not in _BANGLA_STOPWORDS_SET]
+    return " ".join(kept)
+
 
 MIN_CHAR_SCORE = 0.12
 MIN_WORD_SCORE = 0.08
@@ -155,13 +183,13 @@ def _load_news_index():
         _tfidf_vectorizer = char_vectorizer
 
         # word-level TF-IDF: the discriminator between "shares a common
-        # topic word" and "shares the actual distinctive subject" - see the
-        # tuning comment near MIN_CHAR_SCORE above for why this matters.
-        word_vectorizer = TfidfVectorizer(
-            analyzer="word", ngram_range=(1, 2), max_features=50000,
-            stop_words=BANGLA_STOPWORDS,
-        )
-        _word_matrix = word_vectorizer.fit_transform(headlines)
+        # topic word" and "shares the actual distinctive subject" - built
+        # over pre-stripped text (see _strip_stopwords) so generic words
+        # never enter the vocabulary at all, rather than trusting sklearn's
+        # own tokenizer/stop_words matching to catch them.
+        stripped_headlines = [_strip_stopwords(h) for h in headlines]
+        word_vectorizer = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), max_features=50000)
+        _word_matrix = word_vectorizer.fit_transform(stripped_headlines)
         _word_vectorizer = word_vectorizer
     else:
         _tfidf_vectorizer = None
@@ -282,7 +310,7 @@ def match_claim(req: MatchClaimRequest):
         return MatchClaimResponse(query=req.text, matches=[], backed=False)
 
     char_scores = linear_kernel(_tfidf_vectorizer.transform([req.text]), _tfidf_matrix)[0]
-    word_scores = linear_kernel(_word_vectorizer.transform([req.text]), _word_matrix)[0]
+    word_scores = linear_kernel(_word_vectorizer.transform([_strip_stopwords(req.text)]), _word_matrix)[0]
     # Average the two signals into one ranking/display score - char catches
     # spelling variants, word catches the actual distinctive subject; a
     # genuinely relevant headline should score reasonably on both.
