@@ -2,12 +2,8 @@ import os, json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pandas as pd
-import faiss
 from huggingface_hub import hf_hub_download, upload_file
-
-from embed_utils import embed_texts
 
 INDEX_REPO = "gulamsakaria/commentlens-news-index"
 ARCHIVE_REPO = "gulamsakaria/commentlens-news-archive"
@@ -46,9 +42,7 @@ def main():
     # normalize the archive's column names to what the index expects
     new_df = new_df.rename(columns={"published_date": "date", "url": "link"})
 
-    idx_path = hf_hub_download(INDEX_REPO, "index.faiss", repo_type="dataset")
     meta_path = hf_hub_download(INDEX_REPO, "meta.json", repo_type="dataset")
-    index = faiss.read_index(idx_path)
     meta = json.load(open(meta_path, encoding="utf-8"))
 
     # skip anything already indexed (by link), in case this ever re-runs for
@@ -59,17 +53,13 @@ def main():
         print(f"All {TARGET_DATE} rows were already indexed -- skipping.")
         return
 
-    texts = ("query: " + new_df["headline"].fillna("")).tolist()
-    new_vectors = embed_texts(texts)
-
-    index.add(np.array(new_vectors, dtype="float32"))
+    # No embedding step needed anymore - /match_claim builds a TF-IDF index
+    # over the headlines at query time in app.py, so this job just has to
+    # keep meta.json (headline + date + link) up to date.
     meta.extend(new_df[["headline", "date", "link"]].to_dict(orient="records"))
 
-    faiss.write_index(index, "index.faiss")
     json.dump(meta, open("meta.json", "w", encoding="utf-8"), ensure_ascii=False)
 
-    upload_file(path_or_fileobj="index.faiss", path_in_repo="index.faiss",
-        repo_id=INDEX_REPO, repo_type="dataset", token=os.environ["HF_TOKEN"])
     upload_file(path_or_fileobj="meta.json", path_in_repo="meta.json",
         repo_id=INDEX_REPO, repo_type="dataset", token=os.environ["HF_TOKEN"])
     print(f"Added {len(new_df)} new articles ({TARGET_DATE}) to the index.")
