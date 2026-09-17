@@ -5,12 +5,12 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import faiss
-from sentence_transformers import SentenceTransformer
 from huggingface_hub import hf_hub_download, upload_file
+
+from embed_utils import embed_texts
 
 INDEX_REPO = "gulamsakaria/commentlens-news-index"
 ARCHIVE_REPO = "gulamsakaria/commentlens-news-archive"
-MODEL_NAME = "intfloat/multilingual-e5-small"
 
 # The existing daily news scraper (a separate job) writes one CSV per day to
 # the commentlens-news-archive dataset repo, at exports/YYYY-MM-DD.csv, with
@@ -59,9 +59,8 @@ def main():
         print(f"All {TARGET_DATE} rows were already indexed -- skipping.")
         return
 
-    model = SentenceTransformer(MODEL_NAME)
     texts = ("query: " + new_df["headline"].fillna("")).tolist()
-    new_vectors = model.encode(texts, normalize_embeddings=True)
+    new_vectors = embed_texts(texts)
 
     index.add(np.array(new_vectors, dtype="float32"))
     meta.extend(new_df[["headline", "date", "link"]].to_dict(orient="records"))
@@ -70,9 +69,9 @@ def main():
     json.dump(meta, open("meta.json", "w", encoding="utf-8"), ensure_ascii=False)
 
     upload_file(path_or_fileobj="index.faiss", path_in_repo="index.faiss",
-                repo_id=INDEX_REPO, repo_type="dataset", token=os.environ["HF_TOKEN"])
+        repo_id=INDEX_REPO, repo_type="dataset", token=os.environ["HF_TOKEN"])
     upload_file(path_or_fileobj="meta.json", path_in_repo="meta.json",
-                repo_id=INDEX_REPO, repo_type="dataset", token=os.environ["HF_TOKEN"])
+        repo_id=INDEX_REPO, repo_type="dataset", token=os.environ["HF_TOKEN"])
     print(f"Added {len(new_df)} new articles ({TARGET_DATE}) to the index.")
 
 
