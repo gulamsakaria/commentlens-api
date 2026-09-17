@@ -1,0 +1,17 @@
+name: daily-news-index
+on:
+  schedule:
+    - cron: "0 21 * * *"
+  workflow_dispatch: {}
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install sentence-transformers faiss-cpu huggingface_hub pandas
+      - run: python daily_update.py
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      - run: curl -X POST https://commentlens-api.onrender.com/reload_index
