@@ -14,15 +14,14 @@ import logging
 from typing import Dict, List, Optional
 
 import numpy as np
-import faiss
 import onnxruntime as ort
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
-
-from embed_utils import embed_texts
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import linear_kernel
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("commentlens-api")
@@ -52,15 +51,19 @@ _tokenizer = None
 _session = None
 _load_seconds = None
 
-_news_index = None
+# News-matching is done with a TF-IDF (character n-gram) index built at
+# load time from meta.json's headlines - no second neural model, so this
+# has to share Render's 512MB free tier only with the onnxruntime
+# classifier session above, and comfortably does.
+_tfidf_vectorizer = None
+_tfidf_matrix = None
 _news_meta: List[dict] = []
+_news_index_ready = False
 _news_index_loaded_at = None
 
 
 def _onnx_session_options():
-    # Keep the ONNX Runtime memory footprint as small as possible - this
-    # session shares Render's 512MB free tier with the embedding model's
-    # session in embed_utils.py.
+    # Keep the ONNX Runtime memory footprint as small as possible.
     opts = ort.SessionOptions()
     opts.enable_cpu_mem_arena = False
     opts.enable_mem_pattern = False
@@ -88,24 +91,31 @@ def _load_model():
 
 
 def _load_news_index():
-    """Download the FAISS index + headline metadata for the news-matching
-    feature from the commentlens-news-index dataset repo on Hugging Face
-    and load them into memory. Raises if the index isn't there yet."""
-    global _news_index, _news_meta, _news_index_loaded_at
+    """Download the headline metadata for the news-matching feature from
+    the commentlens-news-index dataset repo on Hugging Face and build a
+    TF-IDF (character n-gram) index over it in memory. Raises if the
+    metadata file isn't there yet."""
+    global _tfidf_vectorizer, _tfidf_matrix, _news_meta, _news_index_ready, _news_index_loaded_at
 
-    logger.info("Downloading news index from %s ...", NEWS_INDEX_REPO)
-    idx_path = hf_hub_download(NEWS_INDEX_REPO, "index.faiss", repo_type="dataset")
+    logger.info("Downloading news index metadata from %s ...", NEWS_INDEX_REPO)
     meta_path = hf_hub_download(NEWS_INDEX_REPO, "meta.json", repo_type="dataset")
-
-    _news_index = faiss.read_index(idx_path)
     with open(meta_path, encoding="utf-8") as f:
         _news_meta = json.load(f)
+
+    if _news_meta:
+        headlines = [rec.get("headline", "") for rec in _news_meta]
+        # char n-grams work for Bangla script and romanized Banglish alike,
+        # and don't depend on a language-specific word tokenizer.
+        vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), max_features=50000)
+        _tfidf_matrix = vectorizer.fit_transform(headlines)
+        _tfidf_vectorizer = vectorizer
+    else:
+        _tfidf_vectorizer = None
+        _tfidf_matrix = None
+
+    _news_index_ready = True
     _news_index_loaded_at = time.time()
-    logger.info(
-        "News index loaded: %d vectors, %d meta records",
-        _news_index.ntotal,
-        len(_news_meta),
-    )
+    logger.info("News index loaded: %d headlines", len(_news_meta))
 
 
 @app.on_event("startup")
@@ -203,18 +213,24 @@ def predict(req: PredictRequest):
 
 @app.post("/match_claim", response_model=MatchClaimResponse)
 def match_claim(req: MatchClaimRequest):
-    if _news_index is None:
+    if not _news_index_ready:
         raise HTTPException(
             status_code=503,
             detail="news index not loaded yet - call /reload_index",
         )
 
-    query_vector = embed_texts(["query: " + req.text])
-    scores, indices = _news_index.search(np.array(query_vector, dtype="float32"), req.top_k)
+    if _tfidf_matrix is None or _tfidf_vectorizer is None:
+        # index is ready but has no articles indexed yet
+        return MatchClaimResponse(query=req.text, matches=[])
+
+    query_vector = _tfidf_vectorizer.transform([req.text])
+    scores = linear_kernel(query_vector, _tfidf_matrix)[0]
+    top_indices = scores.argsort()[::-1][: req.top_k]
 
     matches = []
-    for score, idx in zip(scores[0], indices[0]):
-        if idx < 0 or idx >= len(_news_meta):
+    for idx in top_indices:
+        score = float(scores[idx])
+        if score <= 0:
             continue
         record = _news_meta[idx]
         matches.append(
@@ -222,7 +238,7 @@ def match_claim(req: MatchClaimRequest):
                 headline=record.get("headline", ""),
                 date=record.get("date"),
                 link=record.get("link"),
-                score=float(score),
+                score=score,
             )
         )
 
@@ -239,6 +255,6 @@ def reload_index():
 
     return ReloadIndexResponse(
         status="ok",
-        vectors=_news_index.ntotal,
+        vectors=len(_news_meta),
         meta_records=len(_news_meta),
     )
