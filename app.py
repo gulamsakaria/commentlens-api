@@ -7,7 +7,6 @@ for a light, fast CPU footprint) and serves it over a small FastAPI app.
 
 Classes: claim, general, opinion, spam-scam, toxic
 """
-
 import time
 import json
 import logging
@@ -29,8 +28,31 @@ logger = logging.getLogger("commentlens-api")
 MODEL_REPO = "gulamsakaria/commentlens-banglishbert"
 ONNX_FILENAME = "onnx/model_quantized.onnx"
 MAX_LENGTH = 128
-
 NEWS_INDEX_REPO = "gulamsakaria/commentlens-news-index"
+
+# --- News-matching tuning -----------------------------------------------
+# These are starting points, not exact science - tune them against a
+# handful of known true-positive and known false-positive claims once the
+# index has real data in it (see "Not done yet" note at the bottom of this
+# file for how to do that).
+#
+# A candidate headline only counts as a "match" if BOTH signals clear their
+# own floor. This is the fix for a specific failure mode: a claim naming a
+# person (e.g. a politician) was matching unrelated headlines that only
+# shared generic topic words ("doctor", "Malaysia") with the claim, and
+# none of the matched headlines even mentioned the person named in the
+# claim. Char n-grams alone can't tell a generic shared word from a shared
+# name - word-level TF-IDF can, because a word's IDF weight drops the more
+# headlines it appears in, so a common topic word ends up contributing
+# little to the score while a name that appears in only a few headlines
+# contributes a lot. Requiring both signals means a match can't be driven
+# by common vocabulary alone.
+MIN_CHAR_SCORE = 0.12
+MIN_WORD_SCORE = 0.08
+# A match can pass the floor above yet still be a fairly weak, low-confidence
+# echo. "backed" is reserved for a genuinely strong match so the popup badge
+# doesn't call a weak coincidence "news-backed".
+BACKED_MIN_SCORE = 0.25
 
 ID2LABEL = {0: "claim", 1: "general", 2: "opinion", 3: "spam-scam", 4: "toxic"}
 
@@ -39,7 +61,6 @@ app = FastAPI(
     description="Bangla/Banglish comment classifier (claim / general / opinion / spam-scam / toxic)",
     version="1.0.0",
 )
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,12 +72,14 @@ _tokenizer = None
 _session = None
 _load_seconds = None
 
-# News-matching is done with a TF-IDF (character n-gram) index built at
-# load time from meta.json's headlines - no second neural model, so this
-# has to share Render's 512MB free tier only with the onnxruntime
-# classifier session above, and comfortably does.
-_tfidf_vectorizer = None
+# News-matching uses two TF-IDF indexes built at load time from meta.json's
+# headlines - no second neural model, so this has to share Render's 512MB
+# free tier only with the onnxruntime classifier session above, and
+# comfortably does.
+_tfidf_vectorizer = None   # char n-gram index (spelling/inflection variants)
 _tfidf_matrix = None
+_word_vectorizer = None    # word-level index (the entity/topic discriminator)
+_word_matrix = None
 _news_meta: List[dict] = []
 _news_index_ready = False
 _news_index_loaded_at = None
@@ -92,10 +115,12 @@ def _load_model():
 
 def _load_news_index():
     """Download the headline metadata for the news-matching feature from
-    the commentlens-news-index dataset repo on Hugging Face and build a
-    TF-IDF (character n-gram) index over it in memory. Raises if the
+    the commentlens-news-index dataset repo on Hugging Face and build two
+    TF-IDF indexes over it in memory (char n-gram + word-level - see the
+    tuning comment near MIN_CHAR_SCORE for why both). Raises if the
     metadata file isn't there yet."""
-    global _tfidf_vectorizer, _tfidf_matrix, _news_meta, _news_index_ready, _news_index_loaded_at
+    global _tfidf_vectorizer, _tfidf_matrix, _word_vectorizer, _word_matrix
+    global _news_meta, _news_index_ready, _news_index_loaded_at
 
     logger.info("Downloading news index metadata from %s ...", NEWS_INDEX_REPO)
     meta_path = hf_hub_download(NEWS_INDEX_REPO, "meta.json", repo_type="dataset")
@@ -104,14 +129,25 @@ def _load_news_index():
 
     if _news_meta:
         headlines = [rec.get("headline", "") for rec in _news_meta]
+
         # char n-grams work for Bangla script and romanized Banglish alike,
-        # and don't depend on a language-specific word tokenizer.
-        vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), max_features=50000)
-        _tfidf_matrix = vectorizer.fit_transform(headlines)
-        _tfidf_vectorizer = vectorizer
+        # and don't depend on a language-specific word tokenizer - good at
+        # catching spelling/inflection variants of the same word.
+        char_vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), max_features=50000)
+        _tfidf_matrix = char_vectorizer.fit_transform(headlines)
+        _tfidf_vectorizer = char_vectorizer
+
+        # word-level TF-IDF: the discriminator between "shares a common
+        # topic word" and "shares the actual distinctive subject" - see the
+        # tuning comment near MIN_CHAR_SCORE above for why this matters.
+        word_vectorizer = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), max_features=50000)
+        _word_matrix = word_vectorizer.fit_transform(headlines)
+        _word_vectorizer = word_vectorizer
     else:
         _tfidf_vectorizer = None
         _tfidf_matrix = None
+        _word_vectorizer = None
+        _word_matrix = None
 
     _news_index_ready = True
     _news_index_loaded_at = time.time()
@@ -157,6 +193,10 @@ class NewsMatch(BaseModel):
 class MatchClaimResponse(BaseModel):
     query: str
     matches: List[NewsMatch]
+    # Reserved for a genuinely strong match (see BACKED_MIN_SCORE) - the
+    # popup's badge reads this directly, it no longer has to guess it from
+    # matches.length on the frontend.
+    backed: bool = False
 
 
 class ReloadIndexResponse(BaseModel):
@@ -199,7 +239,6 @@ def predict(req: PredictRequest):
     logits = _session.run(None, inputs)[0][0]
     exp = np.exp(logits - np.max(logits))
     probs = exp / exp.sum()
-
     label_idx = int(np.argmax(probs))
     inference_ms = round((time.time() - t0) * 1000, 2)
 
@@ -218,19 +257,28 @@ def match_claim(req: MatchClaimRequest):
             status_code=503,
             detail="news index not loaded yet - call /reload_index",
         )
-
-    if _tfidf_matrix is None or _tfidf_vectorizer is None:
+    if _tfidf_matrix is None or _tfidf_vectorizer is None or _word_matrix is None or _word_vectorizer is None:
         # index is ready but has no articles indexed yet
-        return MatchClaimResponse(query=req.text, matches=[])
+        return MatchClaimResponse(query=req.text, matches=[], backed=False)
 
-    query_vector = _tfidf_vectorizer.transform([req.text])
-    scores = linear_kernel(query_vector, _tfidf_matrix)[0]
-    top_indices = scores.argsort()[::-1][: req.top_k]
+    char_scores = linear_kernel(_tfidf_vectorizer.transform([req.text]), _tfidf_matrix)[0]
+    word_scores = linear_kernel(_word_vectorizer.transform([req.text]), _word_matrix)[0]
+    # Average the two signals into one ranking/display score - char catches
+    # spelling variants, word catches the actual distinctive subject; a
+    # genuinely relevant headline should score reasonably on both.
+    combined_scores = (char_scores + word_scores) / 2
+
+    top_indices = combined_scores.argsort()[::-1][: req.top_k]
 
     matches = []
     for idx in top_indices:
-        score = float(scores[idx])
-        if score <= 0:
+        char_score = float(char_scores[idx])
+        word_score = float(word_scores[idx])
+        # Both signals must individually clear their floor - a headline
+        # that only wins on shared common words (high char, near-zero word)
+        # or only on a coincidental character overlap (high word from
+        # noise, near-zero char) gets dropped either way.
+        if char_score < MIN_CHAR_SCORE or word_score < MIN_WORD_SCORE:
             continue
         record = _news_meta[idx]
         matches.append(
@@ -238,11 +286,12 @@ def match_claim(req: MatchClaimRequest):
                 headline=record.get("headline", ""),
                 date=record.get("date"),
                 link=record.get("link"),
-                score=score,
+                score=float(combined_scores[idx]),
             )
         )
 
-    return MatchClaimResponse(query=req.text, matches=matches)
+    backed = any(m.score >= BACKED_MIN_SCORE for m in matches)
+    return MatchClaimResponse(query=req.text, matches=matches, backed=backed)
 
 
 @app.post("/reload_index", response_model=ReloadIndexResponse)
@@ -252,7 +301,6 @@ def reload_index():
     except Exception as exc:
         logger.exception("Failed to reload news index")
         raise HTTPException(status_code=502, detail=f"failed to reload news index: {exc}")
-
     return ReloadIndexResponse(
         status="ok",
         vectors=len(_news_meta),
