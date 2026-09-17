@@ -21,7 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
-from sentence_transformers import SentenceTransformer
+
+from embed_utils import embed_texts
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("commentlens-api")
@@ -31,7 +32,6 @@ ONNX_FILENAME = "onnx/model_quantized.onnx"
 MAX_LENGTH = 128
 
 NEWS_INDEX_REPO = "gulamsakaria/commentlens-news-index"
-EMBED_MODEL_NAME = "intfloat/multilingual-e5-small"
 
 ID2LABEL = {0: "claim", 1: "general", 2: "opinion", 3: "spam-scam", 4: "toxic"}
 
@@ -52,7 +52,6 @@ _tokenizer = None
 _session = None
 _load_seconds = None
 
-_embed_model = None
 _news_index = None
 _news_meta: List[dict] = []
 _news_index_loaded_at = None
@@ -75,11 +74,7 @@ def _load_news_index():
     """Download the FAISS index + headline metadata for the news-matching
     feature from the commentlens-news-index dataset repo on Hugging Face
     and load them into memory. Raises if the index isn't there yet."""
-    global _embed_model, _news_index, _news_meta, _news_index_loaded_at
-
-    if _embed_model is None:
-        logger.info("Loading sentence embedding model %s ...", EMBED_MODEL_NAME)
-        _embed_model = SentenceTransformer(EMBED_MODEL_NAME)
+    global _news_index, _news_meta, _news_index_loaded_at
 
     logger.info("Downloading news index from %s ...", NEWS_INDEX_REPO)
     idx_path = hf_hub_download(NEWS_INDEX_REPO, "index.faiss", repo_type="dataset")
@@ -191,13 +186,13 @@ def predict(req: PredictRequest):
 
 @app.post("/match_claim", response_model=MatchClaimResponse)
 def match_claim(req: MatchClaimRequest):
-    if _news_index is None or _embed_model is None:
+    if _news_index is None:
         raise HTTPException(
             status_code=503,
             detail="news index not loaded yet - call /reload_index",
         )
 
-    query_vector = _embed_model.encode(["query: " + req.text], normalize_embeddings=True)
+    query_vector = embed_texts(["query: " + req.text])
     scores, indices = _news_index.search(np.array(query_vector, dtype="float32"), req.top_k)
 
     matches = []
@@ -230,4 +225,3 @@ def reload_index():
         vectors=_news_index.ntotal,
         meta_records=len(_news_meta),
     )
-
