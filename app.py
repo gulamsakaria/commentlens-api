@@ -47,6 +47,23 @@ NEWS_INDEX_REPO = "gulamsakaria/commentlens-news-index"
 # little to the score while a name that appears in only a few headlines
 # contributes a lot. Requiring both signals means a match can't be driven
 # by common vocabulary alone.
+# Generic geographic/connector/frequent words that, on their own, say
+# nothing about WHAT a headline is actually about - they showed up as the
+# cause of a second false-positive pattern: a claim mentioning "দক্ষিণ
+# এশিয়ার" (South Asia) matched unrelated headlines that only shared those
+# two words, because a small archive doesn't have enough documents for
+# TF-IDF's IDF weighting to recognize them as generic on its own. Stripping
+# them out of the word-level vectorizer means they contribute nothing to
+# word_score - a match can only come from words that actually describe the
+# subject. Extend this list as new false positives like this turn up.
+BANGLA_STOPWORDS = [
+    "দক্ষিণ", "উত্তর", "পূর্ব", "পশ্চিম",
+    "এশিয়া", "এশিয়ার", "বিশ্ব", "বিশ্বের",
+    "বাংলাদেশ", "বাংলাদেশের", "দেশ", "দেশের", "সরকার", "সরকারের",
+    "নিয়ে", "বিষয়ে", "সম্পর্কে", "জানিয়েছে", "জানান", "বলেছেন", "বললেন",
+    "এবং", "ও", "এর", "একটি", "এই", "সেই", "আজ", "গতকাল", "নতুন",
+]
+
 MIN_CHAR_SCORE = 0.12
 MIN_WORD_SCORE = 0.08
 # A match can pass the floor above yet still be a fairly weak, low-confidence
@@ -140,7 +157,10 @@ def _load_news_index():
         # word-level TF-IDF: the discriminator between "shares a common
         # topic word" and "shares the actual distinctive subject" - see the
         # tuning comment near MIN_CHAR_SCORE above for why this matters.
-        word_vectorizer = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), max_features=50000)
+        word_vectorizer = TfidfVectorizer(
+            analyzer="word", ngram_range=(1, 2), max_features=50000,
+            stop_words=BANGLA_STOPWORDS,
+        )
         _word_matrix = word_vectorizer.fit_transform(headlines)
         _word_vectorizer = word_vectorizer
     else:
