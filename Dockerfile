@@ -10,6 +10,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY embed_utils.py .
 
 # Hugging Face's Docker Spaces route external traffic to port 7860 by default
 ENV HF_HOME=/tmp/hf_home
