@@ -57,6 +57,19 @@ _news_meta: List[dict] = []
 _news_index_loaded_at = None
 
 
+def _onnx_session_options():
+    # Keep the ONNX Runtime memory footprint as small as possible - this
+    # session shares Render's 512MB free tier with the embedding model's
+    # session in embed_utils.py.
+    opts = ort.SessionOptions()
+    opts.enable_cpu_mem_arena = False
+    opts.enable_mem_pattern = False
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.intra_op_num_threads = 1
+    opts.inter_op_num_threads = 1
+    return opts
+
+
 def _load_model():
     global _tokenizer, _session, _load_seconds
     t0 = time.time()
@@ -65,7 +78,11 @@ def _load_model():
     logger.info("Downloading ONNX weights (%s) ...", ONNX_FILENAME)
     onnx_path = hf_hub_download(MODEL_REPO, ONNX_FILENAME)
     logger.info("Starting ONNX Runtime session ...")
-    _session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    _session = ort.InferenceSession(
+        onnx_path,
+        sess_options=_onnx_session_options(),
+        providers=["CPUExecutionProvider"],
+    )
     _load_seconds = round(time.time() - t0, 2)
     logger.info("Model ready in %.2fs", _load_seconds)
 

@@ -10,6 +10,13 @@ Pooling mirrors what multilingual-e5-small itself uses: mean-pool the
 last hidden state over non-padding tokens, then L2-normalize - the
 same kind of vectors sentence-transformers would produce, just
 without the heavy dependency.
+
+The ONNX session is configured to be as memory-frugal as possible
+(no memory arena growth, single-threaded, sequential execution) since
+it has to share Render's 512MB free tier with the banglishbert
+classifier session in app.py. Headlines/claims are short, so the
+tokenizer is also capped well below the model's real max length -
+that caps the size of the biggest intermediate activation buffers.
 """
 
 import numpy as np
@@ -19,9 +26,20 @@ from transformers import AutoTokenizer
 
 EMBED_MODEL_REPO = "Xenova/multilingual-e5-small"
 EMBED_ONNX_FILENAME = "onnx/model_quantized.onnx"
+EMBED_MAX_LENGTH = 96
 
 _tokenizer = None
 _session = None
+
+
+def _session_options():
+    opts = ort.SessionOptions()
+    opts.enable_cpu_mem_arena = False
+    opts.enable_mem_pattern = False
+    opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    opts.intra_op_num_threads = 1
+    opts.inter_op_num_threads = 1
+    return opts
 
 
 def _load():
@@ -30,7 +48,11 @@ def _load():
         _tokenizer = AutoTokenizer.from_pretrained(EMBED_MODEL_REPO)
     if _session is None:
         onnx_path = hf_hub_download(EMBED_MODEL_REPO, EMBED_ONNX_FILENAME)
-        _session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        _session = ort.InferenceSession(
+            onnx_path,
+            sess_options=_session_options(),
+            providers=["CPUExecutionProvider"],
+        )
 
 
 def embed_texts(texts):
@@ -40,7 +62,7 @@ def embed_texts(texts):
         list(texts),
         padding=True,
         truncation=True,
-        max_length=512,
+        max_length=EMBED_MAX_LENGTH,
         return_tensors="np",
     )
     onnx_inputs = {
