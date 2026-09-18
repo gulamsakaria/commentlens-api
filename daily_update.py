@@ -41,6 +41,12 @@ def main():
 
     # normalize the archive's column names to what the index expects
     new_df = new_df.rename(columns={"published_date": "date", "url": "link"})
+    # "date" above is the article's published_date, which can differ from
+    # TARGET_DATE (the exports/{TARGET_DATE}.csv file it actually lives in
+    # - e.g. published one day, scraped/archived the next). app.py's
+    # QUOTE-claim body lookup needs the real archive filename, so record it
+    # separately rather than relying on published_date to match it.
+    new_df["export_date"] = TARGET_DATE
 
     meta_path = hf_hub_download(INDEX_REPO, "meta.json", repo_type="dataset")
     meta = json.load(open(meta_path, encoding="utf-8"))
@@ -55,8 +61,8 @@ def main():
 
     # No embedding step needed anymore - /match_claim builds a TF-IDF index
     # over the headlines at query time in app.py, so this job just has to
-    # keep meta.json (headline + date + link) up to date.
-    meta.extend(new_df[["headline", "date", "link"]].to_dict(orient="records"))
+    # keep meta.json (headline + date + link + export_date) up to date.
+    meta.extend(new_df[["headline", "date", "link", "export_date"]].to_dict(orient="records"))
 
     json.dump(meta, open("meta.json", "w", encoding="utf-8"), ensure_ascii=False)
 

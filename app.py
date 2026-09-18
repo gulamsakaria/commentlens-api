@@ -37,10 +37,22 @@ NEWS_INDEX_REPO = "gulamsakaria/commentlens-news-index"
 
 # The daily scraper writes one CSV per day to this repo at exports/YYYY-MM-DD.csv
 # with columns id, source, headline, body, url, published_date, category, scraped_at
-# (see daily_update.py). meta.json in NEWS_INDEX_REPO only carries
-# headline/date/link forward - body text never made it into the index - so
+# (see daily_update.py). meta.json in NEWS_INDEX_REPO carries headline/date/
+# link/export_date forward - body text never made it into the index - so
 # verifying a QUOTE claim against actual article body text means reaching
-# back into this archive repo on demand, by date + link, at request time.
+# back into this archive repo on demand, by export_date + link, at request
+# time.
+#
+# NOTE: "date" on a meta record is the article's published_date (for
+# display), which is NOT necessarily the same calendar day the archive CSV
+# it lives in is named after - an article can be published one day and
+# scraped/archived the next (or scraped late at night, crossing the Dhaka
+# midnight boundary). "export_date" is the actual exports/{export_date}.csv
+# filename the record was read from, and is what archive lookups must use.
+# Using "date" here was a real bug (fixed): it silently 404'd or fetched
+# the wrong day's CSV whenever published_date != export_date, so
+# _fetch_article_body always came back empty and QUOTE claims could never
+# be backed.
 NEWS_ARCHIVE_REPO = "gulamsakaria/commentlens-news-archive"
 # HF_TOKEN is intentionally scoped write-only on the index repo, so reading
 # the archive needs its own token; same fallback daily_update.py/backfill_index.py
@@ -214,17 +226,21 @@ def _load_archive_day(date: str) -> Dict[str, str]:
     return by_link
 
 
-def _fetch_article_body(date: Optional[str], link: Optional[str]) -> Optional[str]:
+def _fetch_article_body(export_date: Optional[str], link: Optional[str]) -> Optional[str]:
     """Best-effort lookup of a candidate's full article body text from the
     archive repo. Returns None (never raises) on anything short of
     success - a missing/unreadable archive means QUOTE claims fail closed
-    (can't be backed) rather than the endpoint erroring out."""
-    if not date or not link:
+    (can't be backed) rather than the endpoint erroring out.
+
+    Takes export_date (the exports/{export_date}.csv the record actually
+    lives in), NOT the record's published-date "date" field - those two
+    can differ (see the NEWS_ARCHIVE_REPO comment above)."""
+    if not export_date or not link:
         return None
     try:
-        return _load_archive_day(date).get(link)
+        return _load_archive_day(export_date).get(link)
     except Exception as exc:
-        logger.warning("Could not fetch archive body for %s / %s: %s", date, link, exc)
+        logger.warning("Could not fetch archive body for %s / %s: %s", export_date, link, exc)
         return None
 
 
@@ -238,7 +254,12 @@ def _quote_backed_by_body(claim_text: str, candidates: List[dict]) -> bool:
         return False
 
     for record in candidates:
-        body = _fetch_article_body(record.get("date"), record.get("link"))
+        # export_date is the correct field for archive lookups; fall back to
+        # "date" (published_date) only for older meta.json records written
+        # before export_date existed, on the (imperfect but harmless) chance
+        # the two happen to match - see the NEWS_ARCHIVE_REPO comment above.
+        export_date = record.get("export_date") or record.get("date")
+        body = _fetch_article_body(export_date, record.get("link"))
         if not body:
             continue
         normalized_body = _normalize_text(body)
