@@ -38,6 +38,11 @@ def main():
         path = hf_hub_download(ARCHIVE_REPO, f, repo_type="dataset", token=ARCHIVE_TOKEN)
         df = pd.read_csv(path)
         if not df.empty:
+            # f is "exports/YYYY-MM-DD.csv" - that filename is the record's
+            # real export_date (app.py needs this for QUOTE-claim body
+            # lookups; it can differ from the article's own published_date,
+            # see app.py's NEWS_ARCHIVE_REPO comment).
+            df["export_date"] = os.path.splitext(os.path.basename(f))[0]
             frames.append(df)
 
     if not frames:
@@ -50,7 +55,7 @@ def main():
     # de-dupe by link, keep the first occurrence
     full_df = full_df.drop_duplicates(subset="link", keep="first")
 
-    meta = full_df[["headline", "date", "link"]].to_dict(orient="records")
+    meta = full_df[["headline", "date", "link", "export_date"]].to_dict(orient="records")
 
     json.dump(meta, open("meta.json", "w", encoding="utf-8"), ensure_ascii=False)
 

@@ -70,7 +70,7 @@ Response:
 
 ```php
 <?php
-$ch = curl_init("https://gulamsakaria-commentlens-api.hf.space/predict");
+$ch = curl_init("https://commentlens-api.onrender.com/predict");
 curl_setopt($ch, CURLOPT_POST, true);
 curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
 curl_setopt($ch, CURLOPT_HTTPHEADER, ["Content-Type: application/json"]);
