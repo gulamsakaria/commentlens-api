@@ -1,0 +1,9 @@
+numpy
+scikit-learn
+pandas
+pyarrow
+onnxruntime
+onnx
+faiss-cpu
+sentencepiece
+huggingface_hub
